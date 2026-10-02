@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: RAPSTAR Analytics frontend hosting (private S3 + CloudFront + OAC + SPA rewrite)
+
+# This stack is DELIBERATELY isolated from both the Collector stack
+# (`rapstar-analytics-prod`) and the Read API stack
+# (`rapstar-analytics-read-api-prod`). Frontend deploy churn must not touch
+# the data pipeline or the public API.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev]
+    Description: Stage name used in resource naming.
+
+  # S3 bucket names are globally unique. We salt with the AWS account ID so
+  # the template is portable across accounts and cannot clash with buckets
+  # created in other orgs. If a custom name is required (e.g. for a vanity
+  # URL), override on the CLI with --parameter-overrides BucketName=....
+  BucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional explicit bucket name. When blank, falls back to
+      rapstar-analytics-frontend-<env>-<account>. Must be lower-case,
+      3-63 chars, no dots.
+
+Conditions:
+  HasExplicitBucketName: !Not [!Equals [!Ref BucketName, ""]]
+
+Resources:
+  ###
+  ### Private S3 bucket for the built frontend bundle.
+  ###
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    # Retain so a `cloudformation delete-stack` cannot wipe a user-facing
+    # bundle by accident; manual bucket cleanup is a deliberate operator
+    # step.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasExplicitBucketName
+        - !Ref BucketName
+        - !Sub rapstar-analytics-frontend-${Environment}-${AWS::AccountId}
+      # BucketOwnerEnforced disables ACLs entirely — all access control is
+      # via bucket / object policies. ACLs are a legacy failure mode.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # No public access of any kind — CloudFront OAC fetches via a signed
+      # SigV4 request, which is NOT blocked by these settings.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      # Server-side encryption with S3-managed keys. No KMS to keep
+      # CloudFront OAC fetches cheap and simple.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      # Versioning so a bad deploy can be rolled back by re-promoting a prior
+      # object version (helpful during the index.html flip).
+      VersioningConfiguration:
+        Status: Enabled
+      # Keep storage from accumulating indefinitely. Current (latest)
+      # versions are NEVER deleted automatically — the rules only touch
+      # noncurrent revisions, orphaned delete markers and abandoned
+      # multipart uploads.
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent-versions-and-markers
+            Status: Enabled
+            # Scope: whole bucket. CFN's `Filter` + `Prefix: ""` combo
+            # is rejected by Early Validation; the deprecated top-level
+            # `Prefix: ""` is the accepted way to signal "all objects".
+            Prefix: ""
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            # Delete markers left behind once their last noncurrent version
+            # is gone — otherwise they linger as "empty tombstones".
+            ExpiredObjectDeleteMarker: true
+            # Garbage-collect uploads that never finished (deploy aborts).
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - { Key: Project, Value: rapstar-analytics }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Role, Value: frontend-hosting }
+
+  ###
+  ### CloudFront Origin Access Control (OAC) — modern replacement for OAI.
+  ### Uses SigV4 so the policy can be scoped to a specific distribution ARN.
+  ###
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub rapstar-analytics-frontend-${Environment}-oac
+        Description: SigV4 OAC for the frontend S3 bucket; only this CF distribution may read.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ###
+  ### CloudFront Function: viewer-request URI rewrite for React Router SPA.
+  ### Runs on every viewer request at the edge (sub-ms, no cold start).
+  ###
+  SpaRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub rapstar-analytics-frontend-${Environment}-spa-rewrite
+      AutoPublish: true
+      FunctionConfig:
+        Comment: SPA URI rewrite — extensionless paths serve /index.html.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+
+          // The frontend is a React Router SPA served by a SINGLE
+          // index.html at the bucket root. Any URI whose last path segment
+          // has no file extension (and that includes the empty tail of
+          // "/" and "/some/dir/") must be routed to /index.html so React
+          // Router can take over client-side. Real files (hashed assets
+          // under /assets/, /favicon.ico, …) always keep their last-segment
+          // dot and are passed through untouched.
+          var tail = uri.substring(uri.lastIndexOf('/') + 1);
+          if (tail === '' || tail.indexOf('.') === -1) {
+            request.uri = '/index.html';
+            return request;
+          }
+          return request;
+        }
+
+  ###
+  ### Security headers injected by CloudFront on every response.
+  ### CSP is intentionally omitted — we need to enumerate every third-party
+  ### host (Instagram CDN, API Gateway, custom domain) before locking it
+  ### down. Added as a follow-up when the connectivity list is final.
+  ###
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub rapstar-analytics-frontend-${Environment}-security-headers
+        Comment: Baseline security headers for the frontend; CSP added later.
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          # X-XSS-Protection intentionally omitted: it is deprecated,
+          # non-standard, and (in `1; mode=block`) has caused information
+          # leaks in some browsers. CSP will cover XSS defence in a later
+          # phase once the connectivity list is final.
+
+  ###
+  ### Cache policy: origin-driven TTLs so the deploy script controls caching
+  ### via per-object `Cache-Control`. Hashed `/assets/*` get a year
+  ### (immutable), `index.html` gets `no-cache`. No cookies / headers /
+  ### query strings forwarded — the frontend is purely static.
+  ###
+  FrontendCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub rapstar-analytics-frontend-${Environment}-origin-driven
+        Comment: Origin-driven TTLs. Honors Cache-Control from S3 object metadata.
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig: { CookieBehavior: none }
+          HeadersConfig: { HeaderBehavior: none }
+          QueryStringsConfig: { QueryStringBehavior: none }
+
+  ###
+  ### CloudFront Distribution — one default behavior; SPA rewrite + security
+  ### headers + origin-driven cache. HTTP/2 + HTTP/3, IPv6, redirect-to-https.
+  ###
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub RAPSTAR Analytics frontend (${Environment})
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        DefaultRootObject: index.html
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            # Must be set to empty for OAC-based S3 origins (per AWS docs).
+            S3OriginConfig: { OriginAccessIdentity: "" }
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !Ref FrontendCachePolicy
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRewriteFunction.FunctionMetadata.FunctionARN
+        ViewerCertificate:
+          # Default CloudFront certificate for the dxxx.cloudfront.net domain.
+          # Switched to an ACM cert in us-east-1 when the custom domain
+          # (rapstar-analytics.com) is attached (next phase).
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - { Key: Project, Value: rapstar-analytics }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ###
+  ### Bucket policy — ONLY the CF distribution (via OAC/SigV4) may s3:GetObject.
+  ### No s3:ListBucket is granted (CF uses direct GetObject by key).
+  ###
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOACGet
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+
+Outputs:
+  FrontendBucketName:
+    Description: Name of the private S3 bucket serving the built frontend.
+    Value: !Ref FrontendBucket
+  FrontendBucketArn:
+    Description: ARN of the frontend S3 bucket (useful for IAM policies).
+    Value: !GetAtt FrontendBucket.Arn
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (used by `create-invalidation`).
+    Value: !Ref FrontendDistribution
+  CloudFrontDomainName:
+    Description: Default CloudFront domain name serving the frontend.
+    Value: !GetAtt FrontendDistribution.DomainName
+  CloudFrontDistributionArn:
+    Description: CloudFront distribution ARN (referenced in the S3 bucket policy).
+    Value: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}

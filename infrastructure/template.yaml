@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: RAPSTAR Analytics collector (Lambda + EventBridge Scheduler + DynamoDB)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev]
+
+  IgBusinessAccountId:
+    Type: String
+    Description: Your own IG Business Account ID (non-secret numeric ID)
+
+  TargetUsername:
+    Type: String
+    Default: rapstar_starz
+
+  GraphApiVersion:
+    Type: String
+    Default: v26.0
+
+  IgTokenParamName:
+    Type: String
+    Default: /rapstar-analytics/ig-user-access-token
+    Description: SSM SecureString param name. The value is populated OUT OF BAND (aws ssm put-parameter).
+
+  MetaAppSecretParamName:
+    Type: String
+    Default: /rapstar-analytics/meta-app-secret
+
+  MetaAppIdParamName:
+    Type: String
+    Default: /rapstar-analytics/meta-app-id
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 0 * * ? *)
+    Description: EventBridge Scheduler expression in UTC. Default 09:00 JST (00:00 UTC).
+
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Deploy DISABLED to prevent immediate execution.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email to receive alarm notifications. Leave empty to skip subscription.
+
+# NOTE: The read-only public API (STEP 5-B onwards) lives in a separate SAM
+# template — see `read-api-template.yaml`. It is deployed as its own
+# CloudFormation stack so that changes to the API code cannot ever trigger
+# a re-deploy of the collector Lambda in this stack.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    MemorySize: 512
+    # 300s = 5min. Empirical worst case for 500 posts:
+    #   ~20 API calls * 1s = 20s
+    #   ~500 posts * ~50ms DynamoDB writes (post + snapshot + update_latest) = ~75s
+    #   Token debug + overhead: ~5s
+    # → ~100s typical. Set to 300s to absorb Meta throttling / cold DynamoDB latency
+    # and give EventBridge Scheduler retry policy room.
+    Timeout: 300
+    Tags:
+      Project: rapstar-analytics
+      Environment: !Ref Environment
+
+Resources:
+
+  ###
+  ### DynamoDB tables
+  ###
+  PostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub rapstar-${Environment}-posts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: external_post_id, AttributeType: S }
+        - { AttributeName: classification, AttributeType: S }
+        - { AttributeName: posted_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: external_post_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: classification-posted_at-index
+          KeySchema:
+            - { AttributeName: classification, KeyType: HASH }
+            - { AttributeName: posted_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  SnapshotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub rapstar-${Environment}-metric-snapshots
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: external_post_id, AttributeType: S }
+        - { AttributeName: fetched_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: external_post_id, KeyType: HASH }
+        - { AttributeName: fetched_at, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  FetchRunsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub rapstar-${Environment}-fetch-runs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: run_id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: started_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: run_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: status-started_at-index
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: started_at, KeyType: RANGE }
+          Projection: { ProjectionType: KEYS_ONLY }
+
+  TokenAuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub rapstar-${Environment}-access-tokens
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: partition, AttributeType: S }
+        - { AttributeName: recorded_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: partition, KeyType: HASH }
+        - { AttributeName: recorded_at, KeyType: RANGE }
+
+  LockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub rapstar-${Environment}-collect-lock
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: name, AttributeType: S }
+      KeySchema:
+        - { AttributeName: name, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  ###
+  ### Lambda: Collector
+  ###
+  CollectorFunction:
+    Type: AWS::Serverless::Function
+    # Custom makefile build (see collector-lambda/Makefile). Assembles a
+    # minimal zip whose root contains `collector/` (source) plus pinned
+    # runtime deps — nothing else from the repo (no backups/, data/,
+    # frontend/, .env*, etc.) can leak into the Lambda package.
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub rapstar-${Environment}-collector
+      CodeUri: ./collector-lambda/
+      Handler: collector.aws.handler.lambda_handler
+      Environment:
+        Variables:
+          IG_BUSINESS_ACCOUNT_ID: !Ref IgBusinessAccountId
+          TARGET_IG_USERNAME: !Ref TargetUsername
+          GRAPH_API_VERSION: !Ref GraphApiVersion
+          IG_TOKEN_PARAM: !Ref IgTokenParamName
+          META_APP_SECRET_PARAM: !Ref MetaAppSecretParamName
+          META_APP_ID_PARAM: !Ref MetaAppIdParamName
+          POSTS_TABLE: !Ref PostsTable
+          SNAPSHOTS_TABLE: !Ref SnapshotsTable
+          FETCH_RUNS_TABLE: !Ref FetchRunsTable
+          TOKEN_AUDIT_TABLE: !Ref TokenAuditTable
+          LOCK_TABLE: !Ref LockTable
+          # LOCK_TTL slightly exceeds Lambda Timeout so a killed run's lock
+          # expires soon after, but not so long that EventBridge Scheduler retries
+          # a legitimately failed run are all blocked.
+          LOCK_TTL_SECONDS: "420"
+          COLLECT_MODE: "both"
+          # Low-cardinality dimension for the EMF application metrics
+          # (CollectorRunSuccess/Partial/Failure, MetaApiFailure,
+          # SnapshotsWritten). Read by `_emit_run_metrics`.
+          ENVIRONMENT: !Ref Environment
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:BatchWriteItem
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt PostsTable.Arn
+                - !Sub "${PostsTable.Arn}/index/*"
+                - !GetAtt SnapshotsTable.Arn
+                - !GetAtt FetchRunsTable.Arn
+                - !Sub "${FetchRunsTable.Arn}/index/*"
+                - !GetAtt TokenAuditTable.Arn
+                - !GetAtt LockTable.Arn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${IgTokenParamName}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MetaAppSecretParamName}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MetaAppIdParamName}
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: RapstarAnalytics
+
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CollectorFunction}
+      RetentionInDays: 90
+
+  ###
+  ### EventBridge Scheduler
+  ###
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeCollector
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CollectorFunction.Arn
+
+  CollectorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub rapstar-${Environment}-collect-schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      State: !Ref ScheduleState
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt CollectorFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+
+  ###
+  ### Alerting
+  ###
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub rapstar-${Environment}-alerts
+
+  AlertTopicEmailSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  TokenExpirySoonAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub rapstar-${Environment}-token-expiring-soon
+      Namespace: RapstarAnalytics
+      MetricName: TokenDaysRemaining
+      Statistic: Minimum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 7
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  LambdaFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub rapstar-${Environment}-collector-failures
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref CollectorFunction }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # Application-level alarm: fires when the handler itself returned normally
+  # but the business run status is "error" (e.g. Meta refused the API call,
+  # unexpected logic error). Fed from the EMF metric emitted by
+  # `collector/aws/handler.py:_emit_run_metrics`.
+  # Period: Collector runs daily at 00:00 UTC, so there is at most one data
+  # point per 24h. Period=3600 keeps the alarm responsive within the hour
+  # of the daily run; EvaluationPeriods=1 means one bad hour is enough to
+  # alert. `notBreaching` prevents a false alarm during the 23 silent hours.
+  CollectorRunFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub rapstar-${Environment}-collector-run-failure
+      Namespace: RapstarAnalytics
+      MetricName: CollectorRunFailure
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref CollectorFunction }
+        - { Name: Environment,  Value: !Ref Environment }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # Partial-run alarm: at least one media item was persisted but at least
+  # one failed per-item. Reusing the same AlertTopic — operator can inspect
+  # the LogGroup / fetch_runs table for which item(s) failed.
+  CollectorRunPartialAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub rapstar-${Environment}-collector-run-partial
+      Namespace: RapstarAnalytics
+      MetricName: CollectorRunPartial
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref CollectorFunction }
+        - { Name: Environment,  Value: !Ref Environment }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # NOTE: `MetaApiFailure` metric is emitted but intentionally NOT alarmed.
+  # When Meta blocks the API, both CollectorRunFailure and MetaApiFailure
+  # go to 1 — alarming on both would double-notify for the same incident.
+  # MetaApiFailure is kept as a visualisation / root-cause attribution signal
+  # on the dashboard; the actionable page comes from CollectorRunFailure.
+
+Outputs:
+  CollectorFunctionName:
+    Value: !Ref CollectorFunction
+  PostsTableName:
+    Value: !Ref PostsTable
+  SnapshotsTableName:
+    Value: !Ref SnapshotsTable
+  FetchRunsTableName:
+    Value: !Ref FetchRunsTable
+  TokenAuditTableName:
+    Value: !Ref TokenAuditTable
+  LockTableName:
+    Value: !Ref LockTable
+  AlertTopicArn:
+    Value: !Ref AlertTopic

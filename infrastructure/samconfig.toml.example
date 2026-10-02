@@ -1,0 +1,23 @@
+version = 0.1
+
+# Template for the collector stack's SAM deploy parameters.
+# To activate:
+#   cp samconfig.toml.example samconfig.toml
+#   # then set IgBusinessAccountId to your own IG Business Account numeric ID
+# The real samconfig.toml is gitignored because it carries that account ID.
+
+[default.deploy.parameters]
+stack_name = "rapstar-analytics-prod"
+region = "ap-northeast-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "rapstar-analytics-prod"
+parameter_overrides = "Environment=\"prod\" IgBusinessAccountId=\"\" TargetUsername=\"rapstar_starz\" GraphApiVersion=\"v26.0\" IgTokenParamName=\"/rapstar-analytics/ig-user-access-token\" MetaAppSecretParamName=\"/rapstar-analytics/meta-app-secret\" MetaAppIdParamName=\"/rapstar-analytics/meta-app-id\" ScheduleExpression=\"cron(0 0 * * ? *)\" ScheduleState=\"ENABLED\" AlarmEmail=\"\""
+image_repositories = []
+
+[default.local_invoke.parameters]
+region = "ap-northeast-1"
+
+[default.global.parameters]
+region = "ap-northeast-1"

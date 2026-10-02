@@ -1,0 +1,50 @@
+# Secrets and environment
+.env
+.env.*
+!.env.example
+
+# Python virtualenv / bytecode / tooling caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# Local data / DB / logs (may contain real data)
+data/*.db
+data/*.sqlite*
+data/collect.lock
+logs/*.log
+backups/
+
+# Infrastructure build artifacts
+infrastructure/.aws-sam/
+
+# Local browser verification / ad-hoc screenshots
+.playwright-mcp/
+/rapstar-*.png
+
+# Unused large frontend asset (3.3 MB, not referenced from index.html / src).
+# Kept locally in case it becomes needed later, but excluded from the public
+# bundle so Vite doesn't copy it into dist/ and ship it via CloudFront.
+frontend/public/rapstar-logo.png
+
+# SAM deploy config for the collector stack. Carries non-secret but
+# repo-identifying values (IG Business Account ID) that we don't want in a
+# PUBLIC git history. The read-api variant (read-api-samconfig.toml) has no
+# such values and is NOT ignored. Clone bootstrap:
+#   cp infrastructure/samconfig.toml.example infrastructure/samconfig.toml
+#   # edit IgBusinessAccountId to your value
+infrastructure/samconfig.toml
+
+# IDE / editor
+.vscode/
+.idea/

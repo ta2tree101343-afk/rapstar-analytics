@@ -1,0 +1,17 @@
+version = 0.1
+
+# SAM config for the INDEPENDENT read-only API stack. Deploy with:
+#   sam deploy --template-file read-api-template.yaml --config-file read-api-samconfig.toml
+# This stack is fully separate from the collector stack (rapstar-analytics-prod).
+
+[default.deploy.parameters]
+stack_name = "rapstar-analytics-read-api-prod"
+region = "ap-northeast-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "rapstar-analytics-read-api-prod"
+parameter_overrides = "Environment=\"prod\" CollectorStackNameSuffix=\"prod\" CorsOrigin=\"*\""
+
+[default.global.parameters]
+region = "ap-northeast-1"

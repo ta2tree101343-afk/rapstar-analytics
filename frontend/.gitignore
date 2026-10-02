@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.vite/
+*.local
+.DS_Store
+
+# Vite / TS build artifacts
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Env files (keep the shared template)
+.env
+.env.*
+!.env.example
+
+# Test / lint caches
+coverage/
+.eslintcache

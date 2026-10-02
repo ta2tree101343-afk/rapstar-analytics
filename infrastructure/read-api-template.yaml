@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  RAPSTAR Analytics — read-only public API stack.
+
+  Deployed as an INDEPENDENT CloudFormation stack so that changes here can
+  never trigger a re-deploy of the collector Lambda in the sibling stack
+  (`rapstar-analytics-prod`).
+
+  The API talks to DynamoDB tables that live in the collector stack. This
+  template references them by physical ARN (constructed by convention from
+  the region, account, and known table names) rather than by cross-stack
+  Export/Import, so this stack has zero write-side dependencies on the
+  collector stack.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev]
+
+  CollectorStackNameSuffix:
+    Type: String
+    Default: prod
+    Description: |
+      Environment suffix used when the collector stack named its DynamoDB
+      tables (rapstar-<suffix>-posts, etc). Must match the collector template's
+      Environment parameter.
+
+  CorsOrigin:
+    Type: String
+    Default: "*"
+    Description: |
+      CORS Access-Control-Allow-Origin for the read API. Use "*" for
+      pre-launch testing and lock down to the frontend origin before public
+      launch (e.g. https://your-site.example).
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    Tags:
+      Project: rapstar-analytics
+      Environment: !Ref Environment
+
+Resources:
+  ReadApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rapstar-${Environment}-read-api
+      # CodeUri points at the isolated `read_api/` directory. Nothing outside
+      # that directory is packaged, so the collector Lambda's package hash is
+      # entirely independent from this stack's deployment lifecycle.
+      CodeUri: ../read_api/
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          POSTS_TABLE: !Sub rapstar-${CollectorStackNameSuffix}-posts
+          SNAPSHOTS_TABLE: !Sub rapstar-${CollectorStackNameSuffix}-metric-snapshots
+          FETCH_RUNS_TABLE: !Sub rapstar-${CollectorStackNameSuffix}-fetch-runs
+          CORS_ORIGIN: !Ref CorsOrigin
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              # READ-ONLY. Never PutItem/UpdateItem/DeleteItem/Batch*/Transact*.
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource:
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/rapstar-${CollectorStackNameSuffix}-posts
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/rapstar-${CollectorStackNameSuffix}-posts/index/*
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/rapstar-${CollectorStackNameSuffix}-metric-snapshots
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/rapstar-${CollectorStackNameSuffix}-fetch-runs
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/rapstar-${CollectorStackNameSuffix}-fetch-runs/index/*
+      Events:
+        StatusRoute:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: GET, Path: /api/status }
+        StatusOptions:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: OPTIONS, Path: /api/status }
+        RankingsRoute:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: GET, Path: /api/rankings }
+        RankingsOptions:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: OPTIONS, Path: /api/rankings }
+        PostDetailRoute:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: GET, Path: "/api/posts/{postId}" }
+        PostDetailOptions:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: OPTIONS, Path: "/api/posts/{postId}" }
+        PostHistoryRoute:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: GET, Path: "/api/posts/{postId}/history" }
+        PostHistoryOptions:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: OPTIONS, Path: "/api/posts/{postId}/history" }
+        CompareRoute:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: GET, Path: /api/compare }
+        CompareOptions:
+          Type: HttpApi
+          Properties: { ApiId: !Ref ReadHttpApi, Method: OPTIONS, Path: /api/compare }
+
+  ReadApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ReadApiFunction}
+      RetentionInDays: 30
+
+  ReadHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Sub rapstar-${Environment}-read-api
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+      StageName: $default
+
+Outputs:
+  ReadApiFunctionName:
+    Value: !Ref ReadApiFunction
+  ReadApiEndpoint:
+    Description: HTTP API invoke URL (append /api/... to reach endpoints)
+    Value: !Sub https://${ReadHttpApi}.execute-api.${AWS::Region}.amazonaws.com

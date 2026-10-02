@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-bg-base text-fg-primary font-sans antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  :focus-visible {
+    @apply outline outline-2 outline-fg-primary outline-offset-1 rounded-sm;
+  }
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  .notice-panel {
+    @apply rounded-md border border-border-subtle bg-bg-elevated;
+  }
+  .notice-panel--info {
+    @apply border-l-2 border-l-accent-purple;
+  }
+  .notice-panel--warning {
+    @apply border-l-2 border-l-accent-yellow;
+  }
+  .notice-panel--error {
+    @apply border-l-2 border-l-neg;
+  }
+  .row-highlighted {
+    @apply bg-bg-elevated border-l-2 border-l-accent-yellow;
+  }
+}
